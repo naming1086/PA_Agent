@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QEvent, Qt, QTimer
+from PyQt6.QtGui import QFont
 
 from pa_agent.gui.widgets.candle_item import CandleItem
 from pa_agent.gui.widgets.overlay_lines import OverlayLines
@@ -33,6 +34,25 @@ _Y_TOP_EXTRA_RATIO = 0.04
 _FIT_VISIBLE_BARS = 20
 _AXIS_RESIZE_MIN_WIDTH = 40
 _AXIS_RESIZE_EDGE_PX = 8
+
+# ── 十字光标信息条配色 ────────────────────────────────────────────────────────
+_C_TEXT = "#e6edf3"      # 主文字
+_C_MUTED = "#8b949e"     # 标签/次要
+_C_UP = "#3fb950"        # 涨
+_C_DOWN = "#f85149"      # 跌
+_C_EMA = "#ffc800"       # EMA20（与曲线同色）
+_C_FORMING = "#d29922"   # 未收 K 线
+_INFO_BG_RGBA = (13, 17, 23, 235)
+_INFO_BORDER_RGBA = (48, 54, 63, 255)
+_CHIP_BG = "#1f6feb"     # 跟随鼠标的价格标签
+_CHIP_BG_TIME = "#30363d"  # 时间轴上的标签
+_PRICE_CHIP_OFFSET_PX = 14  # 价格标签相对鼠标的水平偏移
+
+# 读数用等宽字体（Qt 富文本里写 font-family 不生效，必须设到控件上）
+def _info_font() -> QFont:
+    font = QFont("Consolas")
+    font.setPointSize(10)
+    return font
 
 
 class ChartWidget(pg.PlotWidget):
@@ -73,6 +93,46 @@ class ChartWidget(pg.PlotWidget):
 
         vb = self.getViewBox()
         vb.enableAutoRange(x=False, y=False)
+
+        # ── 十字光标 + 当前 K 线信息条 ─────────────────────────────────────
+        # 需要开启 mouse tracking 才能在不按键的情况下收到 MouseMove
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+        cross_pen = pg.mkPen(color=(130, 140, 155, 150), width=1,
+                             style=Qt.PenStyle.DashLine)
+        self._cross_v = pg.InfiniteLine(angle=90, movable=False, pen=cross_pen)
+        self._cross_h = pg.InfiniteLine(angle=0, movable=False, pen=cross_pen)
+        self._cross_v.setZValue(40)
+        self._cross_h.setZValue(40)
+        self._cross_v.hide()
+        self._cross_h.hide()
+        self.addItem(self._cross_v)
+        self.addItem(self._cross_h)
+        bg_brush = pg.mkBrush(color=_INFO_BG_RGBA)
+        bg_pen = pg.mkPen(color=_INFO_BORDER_RGBA, width=1)
+        info_font = _info_font()
+        self._info_item = pg.TextItem(anchor=(0, 0), border=bg_pen, fill=bg_brush)
+        self._info_item.setFont(info_font)
+        self._info_item.setZValue(50)
+        self._info_item.hide()
+        self.addItem(self._info_item)
+
+        # 光标价标签（跟随鼠标显示当前价格）与 K 线时间标签（贴在时间轴）
+        self._price_chip = pg.TextItem(anchor=(0.0, 0.5), border=bg_pen, fill=bg_brush)
+        self._price_chip.setFont(info_font)
+        self._price_chip.setZValue(51)
+        self._price_chip.hide()
+        self.addItem(self._price_chip)
+        self._time_chip = pg.TextItem(anchor=(0.5, 0.0), border=bg_pen, fill=bg_brush)
+        self._time_chip.setFont(info_font)
+        self._time_chip.setZValue(51)
+        self._time_chip.hide()
+        self.addItem(self._time_chip)
+
+        self._cross_idx = 0
+        self._cross_y = 0.0
+        self._cross_view_x = 0.0
+        vb.sigRangeChanged.connect(self._on_view_range_changed)
 
         # 30 Hz redraw timer (task 14.5)
         self._timer = QTimer(self)
@@ -326,8 +386,13 @@ class ChartWidget(pg.PlotWidget):
             vp = self.viewport()
             if self._in_axis_resize_zone(pos.x(), pos.y()):
                 vp.setCursor(Qt.CursorShape.SplitHCursor)
+                self._hide_crosshair()
             else:
                 vp.unsetCursor()
+                self._update_crosshair(ev)
+
+        elif et == QEvent.Type.Leave:
+            self._hide_crosshair()
 
         elif et == QEvent.Type.MouseButtonPress and ev.button() == Qt.MouseButton.LeftButton:
             pos = ev.position()
@@ -540,6 +605,181 @@ class ChartWidget(pg.PlotWidget):
         marker.setPos(x_pos, entry_f)
         self.addItem(marker)
         self._direction_items.append(marker)
+
+    # ── 十字光标 + 当前 K 线信息 ──────────────────────────────────────────────
+
+    def _hide_crosshair(self) -> None:
+        """Hide the crosshair lines and every readout."""
+        self._cross_v.hide()
+        self._cross_h.hide()
+        self._info_item.hide()
+        self._price_chip.hide()
+        self._time_chip.hide()
+
+    def _on_view_range_changed(self) -> None:
+        """Keep the readouts pinned to their corners while pan/zoom."""
+        if self._info_item.isVisible():
+            self._position_overlays()
+
+    def _data_units_per_pixel_x(self) -> float:
+        """一个屏幕像素等于多少个 x 轴（K 线序号）单位，用于把像素偏移换成数据坐标."""
+        vb = self.getViewBox()
+        (x_min, x_max), _ = vb.viewRange()
+        rect = vb.sceneBoundingRect()
+        left = self.mapFromScene(rect.topLeft())
+        right = self.mapFromScene(rect.topRight())
+        width_px = float(right.x() - left.x())
+        if width_px <= 0.0:
+            return 0.0
+        return float(x_max - x_min) / width_px
+
+    def _position_overlays(self) -> None:
+        """Anchor every readout: info top-left, price chip next to the mouse, time chip below."""
+        (x_min, _), (y_min, y_max) = self.getViewBox().viewRange()
+        self._info_item.setPos(float(x_min), float(y_max))
+        self._price_chip.setPos(
+            self._cross_view_x + _PRICE_CHIP_OFFSET_PX * self._data_units_per_pixel_x(),
+            self._cross_y,
+        )
+        self._time_chip.setPos(float(self._cross_idx), float(y_min))
+
+    def _update_crosshair(self, ev) -> None:
+        """Move the crosshair to the mouse position and show the hovered bar."""
+        frame = self._latest_frame
+        if frame is None or not frame.bars:
+            self._hide_crosshair()
+            return
+        scene_pos = self.mapToScene(ev.position().toPoint())
+        vb = self.getViewBox()
+        if not vb.sceneBoundingRect().contains(scene_pos):
+            self._hide_crosshair()
+            return
+        view_pos = vb.mapSceneToView(scene_pos)
+
+        n = len(frame.bars)
+        # x=0 oldest … x=n-1 newest; bars[0] is the newest bar
+        idx = max(0, min(n - 1, int(round(view_pos.x()))))
+        bar_index = n - 1 - idx
+        bar = frame.bars[bar_index]
+
+        self._cross_idx = idx
+        self._cross_y = float(view_pos.y())
+        self._cross_view_x = float(view_pos.x())
+        self._cross_v.setPos(float(idx))
+        self._cross_h.setPos(self._cross_y)
+        self._cross_v.show()
+        self._cross_h.show()
+
+        time_text = self._bar_time_text(bar)
+        self._info_item.setHtml(
+            self._bar_info_html(frame, bar, bar_index, self._cross_y, time_text)
+        )
+        self._price_chip.setHtml(
+            f'<div><span style="background-color:{_CHIP_BG};color:#ffffff">'
+            f'&nbsp;{self._fmt_price(self._cross_y)}&nbsp;</span></div>'
+        )
+        self._time_chip.setHtml(
+            f'<div><span style="background-color:{_CHIP_BG_TIME};color:{_C_TEXT}">'
+            f'&nbsp;{time_text}&nbsp;</span></div>'
+        )
+        self._position_overlays()
+        self._info_item.show()
+        self._price_chip.show()
+        self._time_chip.show()
+
+    # ── 读数格式化 ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _fmt_price(value: float) -> str:
+        """按价格量级选择小数位（黄金 2 位、外汇 4~5 位）."""
+        magnitude = abs(value)
+        if magnitude >= 1000:
+            digits = 2
+        elif magnitude >= 10:
+            digits = 3
+        elif magnitude >= 1:
+            digits = 4
+        else:
+            digits = 5
+        return f"{value:,.{digits}f}"
+
+    @staticmethod
+    def _fmt_volume(value: float) -> str:
+        """成交量紧凑显示：1.2K / 3.4M / 5.6B."""
+        magnitude = abs(value)
+        if magnitude >= 1e9:
+            return f"{value / 1e9:.2f}B"
+        if magnitude >= 1e6:
+            return f"{value / 1e6:.2f}M"
+        if magnitude >= 1e3:
+            return f"{value / 1e3:.2f}K"
+        return f"{value:.0f}"
+
+    @staticmethod
+    def _bar_time_text(bar) -> str:
+        """K 线开盘时间的本地时间字符串."""
+        from datetime import datetime
+
+        from pa_agent.data.datetime_ts import ts_open_to_ms
+
+        ts_ms = ts_open_to_ms(bar.ts_open)
+        return datetime.fromtimestamp(ts_ms / 1000.0).strftime("%m-%d %H:%M")
+
+    def _bar_info_html(
+        self,
+        frame: "KlineFrame",
+        bar,
+        bar_index: int,
+        cross_y: float,
+        time_text: str,
+    ) -> str:
+        """Compose the HTML readout for the hovered bar."""
+        if bar.pct_chg is not None:
+            chg = float(bar.pct_chg)
+        elif bar.open:
+            chg = (bar.close - bar.open) / bar.open * 100.0
+        else:
+            chg = 0.0
+
+        try:
+            ema = float(frame.indicators.ema20[bar_index])
+        except (IndexError, TypeError, ValueError):
+            ema = float("nan")
+        ema_text = self._fmt_price(ema) if not math.isnan(ema) else "—"
+
+        chg_color = _C_UP if chg >= 0 else _C_DOWN
+        close_color = _C_UP if bar.close >= bar.open else _C_DOWN
+        seq_text = f"#{bar.seq}" if bar.seq > 0 else "形成中"
+        if not bar.closed:
+            state_text = f'<span style="color:{_C_FORMING}">未收</span>'
+        else:
+            state_text = f'<span style="color:{_C_MUTED}">已收</span>'
+
+        muted = _C_MUTED
+        return (
+            f'<div style="color:{_C_TEXT};white-space:pre">'
+            # 标题行：时间 · 序号 · 收盘状态
+            f'<div style="color:{muted}">{time_text}&nbsp;&nbsp;'
+            f'<b style="color:{_C_TEXT}">{seq_text}</b>&nbsp;{state_text}</div>'
+            # 开 / 高
+            f'<div><span style="color:{muted}">开</span> {self._fmt_price(bar.open)}'
+            f'&nbsp;&nbsp;&nbsp;<span style="color:{muted}">高</span> '
+            f'{self._fmt_price(bar.high)}</div>'
+            # 低 / 收（收盘价按涨跌着色）
+            f'<div><span style="color:{muted}">低</span> {self._fmt_price(bar.low)}'
+            f'&nbsp;&nbsp;&nbsp;<span style="color:{muted}">收</span> '
+            f'<span style="color:{close_color}">{self._fmt_price(bar.close)}</span></div>'
+            # 涨跌 / 量
+            f'<div><span style="color:{muted}">涨跌</span> '
+            f'<b style="color:{chg_color}">{chg:+.2f}%</b>'
+            f'&nbsp;&nbsp;&nbsp;<span style="color:{muted}">量</span> '
+            f'{self._fmt_volume(bar.volume)}</div>'
+            # EMA20 / 光标价
+            f'<div><span style="color:{_C_EMA}">EMA20 {ema_text}</span>'
+            f'&nbsp;&nbsp;&nbsp;<span style="color:{muted}">光标</span> '
+            f'{self._fmt_price(cross_y)}</div>'
+            '</div>'
+        )
 
     def _clear_candles_and_labels(self) -> None:
         """Remove all candle and label items from the plot."""

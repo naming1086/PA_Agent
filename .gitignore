@@ -27,6 +27,10 @@ config/feishu.json
 *.pem
 *.key
 
+# ── 多实例 profile 目录（每份都带自己的 settings.json，含密钥）──────────────
+profiles/
+!profiles/README.md
+
 # ── 运行时数据（分析记录、经验库、日志、交易导出）────────────────────────────
 logs/*
 !logs/.gitkeep

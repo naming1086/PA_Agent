@@ -139,6 +139,27 @@ class FeishuSettings(BaseModel):
     notify_on_order_only: bool = True
 
 
+class Mt5BridgeSettings(BaseModel):
+    """MT5 信号桥设置：把决策写成 JSON 文件，供 MT5 EA 轮询读取.
+
+    对应 MQ5 侧的 pa_signal_bridge.mq5。folder 留空时自动定位
+    %APPDATA%\\MetaQuotes\\Terminal\\Common\\Files\\PA_Agent\\signals。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = True
+    #: 留空 = 自动探测 MT5 公共 Files 目录（portable 安装需手动填）
+    folder: str = ""
+    #: True = 只在出现下单机会时写文件（order_type 有值且不是「不下单」）
+    order_only: bool = True
+    #: 写入信号的手数；0 = 由 EA 的 InpLot 决定
+    default_volume: float = 0.0
+    include_reasoning: bool = True
+    #: 信号有效期（秒），EA 侧据此丢弃过期信号
+    ttl_seconds: int = 1800
+
+
 class TushareSettings(BaseModel):
     """Tushare Pro data source settings (persisted in ignored settings.json)."""
     model_config = ConfigDict(extra="ignore")
@@ -164,6 +185,7 @@ class Settings(BaseModel):
     validation: ValidationSettings = Field(default_factory=ValidationSettings)
     feishu: FeishuSettings = Field(default_factory=FeishuSettings)
     pushplus: PushPlusSettings = Field(default_factory=PushPlusSettings)
+    mt5_bridge: Mt5BridgeSettings = Field(default_factory=Mt5BridgeSettings)
     tushare: TushareSettings = Field(default_factory=TushareSettings)
 
 

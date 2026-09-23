@@ -7,9 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from pa_agent.config.paths import TRADE_RECORDS_DIR as _TRADE_RECORDS_DIR
 from pa_agent.util.price_tick import infer_price_tick_from_frame
-
-_TRADE_RECORDS_DIR = Path("trade_records")
 
 # Default: no opposite-direction plan at the same structure within N closed bars.
 DEFAULT_STRUCTURE_FLIP_COOLDOWN_BARS = 3

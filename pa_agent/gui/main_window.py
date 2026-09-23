@@ -373,7 +373,12 @@ class MainWindow(QMainWindow):
         _feishu_action.triggered.connect(self._open_feishu_settings_dialog)
         menu_bar.addAction(_feishu_action)
 
-        # 3. 其他通用设置 — 点击直接弹对话框（无下拉）
+        # 3. 推送当前信号到 MT5 — 手动把最近一次决策写成 MQ5 可读的 JSON
+        self._mt5_push_action = QAction("推送当前信号到 MT5", self)
+        self._mt5_push_action.triggered.connect(self._push_current_signal_to_mt5)
+        menu_bar.addAction(self._mt5_push_action)
+
+        # 4. 其他通用设置 — 点击直接弹对话框（无下拉）
         _general_action = QAction("其他通用设置", self)
         _general_action.triggered.connect(self._open_general_settings_dialog)
         menu_bar.addAction(_general_action)
@@ -3391,6 +3396,9 @@ class MainWindow(QMainWindow):
                     getattr(getattr(self._ctx.settings, "general", None), "enable_next_bar_prediction", False)
                 ) if self._ctx.settings is not None else False,
             )
+            # 记住最近一次决策，供「推送当前信号到 MT5」菜单手动复用
+            self._last_stage2_decision = decision
+            self._last_stage2_inner = inner
             from pa_agent.gui.chart_decision_overlay import enrich_decision_for_chart_overlay
 
             cooldown = 3
@@ -4075,6 +4083,22 @@ class MainWindow(QMainWindow):
                     chart_image_path=latest_img,
                     settings=settings,
                 )
+
+                # ── MT5 信号桥：把同一条决策写成 JSON 供 MQ5 EA 读取 ──
+                try:
+                    from pa_agent.notify.mt5_signal_bridge import write_signal
+
+                    signal_path = write_signal(
+                        decision_inner=inner,
+                        stage2_full=decision,
+                        symbol=meta_symbol,
+                        timeframe=meta_timeframe,
+                        settings=settings,
+                    )
+                    if signal_path is not None:
+                        logger.info("MT5 信号桥已写出: %s", signal_path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("MT5 信号桥写出失败（不影响主流程）: %s", exc)
                 from pa_agent.notify.pushplus_notifier import pushplus_is_active
 
                 if pushplus_is_active(settings):
@@ -4272,6 +4296,56 @@ class MainWindow(QMainWindow):
 
         dlg = FeishuSettingsDialog(settings=settings, parent=self)
         dlg.exec()
+
+    def _push_current_signal_to_mt5(self) -> None:
+        """手动把最近一次决策写成 MT5 信号文件（用于验证文件桥是否连通）.
+
+        与下单后自动写的那份内容完全一致；若最近没有分析过决策会提示。
+        注意：这是「再写一份」，MQ5 侧若开着自动下单，会真的按当前价下单。
+        """
+        from PyQt6.QtWidgets import QMessageBox
+
+        inner = getattr(self, "_last_stage2_inner", None)
+        decision = getattr(self, "_last_stage2_decision", None) or {}
+        if not isinstance(inner, dict) or not inner:
+            QMessageBox.information(
+                self,
+                "推送到 MT5",
+                "还没有可用的决策。请先跑一次分析，再点这个菜单。",
+            )
+            return
+
+        settings = getattr(self._ctx, "settings", None)
+        meta_symbol = getattr(getattr(settings, "general", None), "last_symbol", "") or ""
+        meta_timeframe = getattr(getattr(settings, "general", None), "last_timeframe", "") or ""
+
+        try:
+            from pa_agent.notify.mt5_signal_bridge import write_signal
+
+            path = write_signal(
+                decision_inner=inner,
+                stage2_full=decision if isinstance(decision, dict) else None,
+                symbol=meta_symbol,
+                timeframe=meta_timeframe,
+                settings=settings,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("手动推送 MT5 信号失败: %s", exc)
+            QMessageBox.warning(self, "推送到 MT5", f"写入失败：{exc}")
+            return
+
+        if path is None:
+            QMessageBox.information(
+                self,
+                "推送到 MT5",
+                "没有写出文件。常见原因：\n"
+                "• mt5_bridge.enabled = false（settings.json）\n"
+                "• mt5_bridge.order_only = true 且当前决策不是下单信号\n"
+                "• 决策缺少 symbol / entry_price",
+            )
+            return
+
+        QMessageBox.information(self, "推送到 MT5", f"已写出信号文件：\n{path}")
 
     def _open_general_settings_dialog(self) -> None:
         """打开通用设置对话框."""

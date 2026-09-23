@@ -24,9 +24,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from pa_agent.config.paths import TRADE_RECORDS_DIR as _TRADE_RECORDS_DIR
 
-_TRADE_RECORDS_DIR = Path("trade_records")
+logger = logging.getLogger(__name__)
 
 # Maximum bars to show in the chart image
 _CHART_MAX_BARS = 50

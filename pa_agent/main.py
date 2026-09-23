@@ -10,9 +10,18 @@ logger = logging.getLogger(__name__)
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Isolate this instance's runtime state when PA_AGENT_PROFILE is set,
+    # before anything reads settings.json or opens the log file.
+    from pa_agent.config.paths import PROFILE_NAME, ensure_profile_dirs
+
+    state_root = ensure_profile_dirs()
+
     # Early diagnostics before Qt / heavy imports: crash dumps + file logging.
     from pa_agent.util.crash_diagnostics import enable_crash_diagnostics, log_startup_diagnostics
     from pa_agent.util.logging import configure_logging
+
+    if PROFILE_NAME:
+        print(f"[PA Agent] profile = {PROFILE_NAME}   state dir = {state_root}")
 
     enable_crash_diagnostics()
     configure_logging()
