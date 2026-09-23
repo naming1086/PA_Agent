@@ -41,6 +41,22 @@ class MaskingFormatter(logging.Formatter):
         self._api_key = new_key
 
 
+class _ExactNameFilter(logging.Filter):
+    """Drop records emitted by loggers whose name matches exactly.
+
+    Needed because ``logging.getLogger("root")`` does *not* return a logger
+    named "root" — it returns the root logger itself, so lowering its level
+    would silence the whole application instead of just the noisy caller.
+    """
+
+    def __init__(self, names: tuple[str, ...]) -> None:
+        super().__init__()
+        self._names = frozenset(names)
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        return record.name not in self._names
+
+
 # ── Public functions ──────────────────────────────────────────────────────────
 
 _LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
@@ -54,9 +70,13 @@ _QUIET_LOGGER_NAMES = (
     "httpx",
     "tvDatafeed",
     "tvDatafeed.main",
-    "root",  # tvdatafeed uses logging.getLogger("root") for websocket
     "websocket",
 )
+
+# tvdatafeed logs its websocket chatter straight on the root logger, whose
+# record.name is "root".  Those records are dropped by a filter instead of by
+# lowering the root logger level (which would silence the whole application).
+_DROPPED_LOGGER_NAMES = ("root",)
 
 
 def verify_logging_handlers() -> bool:
@@ -107,10 +127,15 @@ def configure_logging(api_key: str = "") -> None:
     )
     file_handler.setFormatter(file_formatter)
 
+    # Drop the noisy records logged directly on the root logger
+    name_filter = _ExactNameFilter(_DROPPED_LOGGER_NAMES)
+    file_handler.addFilter(name_filter)
+
     # Console (stream) handler — INFO+ only; file keeps DEBUG for troubleshooting
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(console_formatter)
+    console_handler.addFilter(name_filter)
 
     handlers: list[logging.Handler] = [file_handler, console_handler]
 
