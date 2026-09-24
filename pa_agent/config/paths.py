@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -58,6 +59,26 @@ _KNOWN_TIMEFRAMES = (
     "M1", "M5", "M15", "M30", "H1", "H2", "H4", "H6", "H12", "D1", "W1", "MN1",
 )
 
+#: 周期展示/下拉框格式（小写单位）：M15 -> 15m, H1 -> 1h, D1 -> 1d, MN1 -> 1M
+_TF_UNIT = {"M": "m", "H": "h", "D": "d", "W": "w"}
+
+
+def _normalize_timeframe(name: str) -> str:
+    """Convert an MT5-style timeframe (``"M15"``) to the combo format (``"15m"``).
+
+    The dropdown uses lowercase units (``15m``/``1h``/``4h``/``1d``), so a profile
+    name such as ``M15`` must be normalised before being written as
+    ``last_timeframe``, otherwise ``QComboBox.setCurrentText`` fails to match and
+    the GUI falls back to the first item (``1m``).
+    """
+    name = (name or "").strip().upper()
+    if name == "MN1":
+        return "1M"
+    m = re.match(r"^([MHWD])(\d+)$", name)
+    if not m:
+        return name.lower()
+    return f"{m.group(2)}{_TF_UNIT.get(m.group(1), m.group(1).lower())}"
+
 
 def _seed_config() -> None:
     """Copy the main config into a freshly created profile (API key etc.)."""
@@ -74,10 +95,11 @@ def _seed_config() -> None:
             except OSError:
                 pass
 
-    # 周期名当 profile 名时，帮用户把周期选好
-    tf = PROFILE_NAME.upper()
-    if tf not in _KNOWN_TIMEFRAMES:
+    # 周期名当 profile 名时，帮用户把周期选好（写成下拉框格式，如 15m / 1h）
+    raw_name = PROFILE_NAME.upper()
+    if raw_name not in _KNOWN_TIMEFRAMES:
         return
+    tf = _normalize_timeframe(raw_name)
     settings_path = CONFIG_DIR / "settings.json"
     if not settings_path.is_file():
         return
@@ -86,7 +108,7 @@ def _seed_config() -> None:
     except (OSError, json.JSONDecodeError):
         return
     general = raw.setdefault("general", {})
-    if general.get("last_timeframe") == tf:
+    if str(general.get("last_timeframe", "")).lower() == tf.lower():
         return
     general["last_timeframe"] = tf
     try:

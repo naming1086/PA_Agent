@@ -541,7 +541,15 @@ class MainWindow(QMainWindow):
         ctrl_layout.addWidget(QLabel("周期:"))
         self._tf_combo = QComboBox()
         self._tf_combo.addItems(["1m", "5m", "15m", "1h", "4h", "1d"])
-        self._tf_combo.setCurrentText(_last_tf)
+        # 周期格式可能不统一（如 profile 种子曾写入 "M15"，下拉框是 "15m"），
+        # 这里做大小写不敏感匹配，避免 setCurrentText 找不到而回退到第一项 "1m"。
+        tf_idx = -1
+        for i in range(self._tf_combo.count()):
+            if self._tf_combo.itemText(i).lower() == str(_last_tf).lower():
+                tf_idx = i
+                break
+        if tf_idx >= 0:
+            self._tf_combo.setCurrentIndex(tf_idx)
         self._tf_combo.setMinimumWidth(60)
         ctrl_layout.addWidget(self._tf_combo)
         self._populate_timeframe_combo_for_source()
