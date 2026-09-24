@@ -70,6 +70,12 @@ input string InpComment            = "PA_Agent"; // 订单注释
 input bool   InpCheckStopsLevel    = true;   // 检查止损/止盈最小距离
 input bool   InpFixStopsLevel      = false;  // 自动放宽过近的 SL/TP（默认否）
 
+//--- 以损订仓：按止损距离与可承受风险反推手数（AI 不输出手数，仓位永远由本 EA 决定）
+input bool   InpRiskBasedLot       = false;  // 启用以损订仓（无止损时回退固定手数）
+input double InpRiskAmount         = 0.0;    // 每笔风险金额（账户货币；0 = 改用 InpRiskPercent）
+input double InpRiskPercent        = 1.0;    // 每笔风险占净值百分比（InpRiskAmount=0 时生效）
+input double InpRiskMaxLot         = 0.0;    // 以损订仓手数上限（0 = 用品种上限）
+
 //--- 一键下单方式（面板按钮使用）
 enum ENUM_QUICK_MODE
   {
@@ -787,6 +793,95 @@ double NormalizeVolumeValue(const string symbol, const double volume)
   }
 
 //+------------------------------------------------------------------+
+//| Position sizing from the stop distance (以损订仓)                 |
+//+------------------------------------------------------------------+
+//| Lot = 可承受风险金额 / (止损距离 × 每跳动价值 / 每跳动价格)        |
+//|                                                                  |
+//| The AI never emits a lot size (hard rule in 提示词大纲), so the EA |
+//| owns position sizing entirely.  Deriving the lot from the stop    |
+//| keeps the money at risk constant no matter how wide or tight the  |
+//| stop is: a tight stop gets a bigger lot, a wide stop a smaller    |
+//| one — the loss if stopped out is always the configured amount.    |
+//|                                                                  |
+//| Falls back to *fallbackVolume* whenever the risk cannot be        |
+//| quantified (no stop loss, or the symbol reports no tick value).   |
+//+------------------------------------------------------------------+
+double RiskBasedVolume(const string symbol, const double entry, const double sl,
+                       const double fallbackVolume, string &note)
+  {
+   note = "";
+   if(!InpRiskBasedLot)
+      return fallbackVolume;
+
+   //--- A stop loss is the whole basis of the calculation
+   if(sl <= 0.0)
+     {
+      note = "以损订仓：本单无止损，无法按风险订仓，已用固定手数；";
+      return fallbackVolume;
+     }
+
+   double dist = MathAbs(entry - sl);
+   if(dist <= 0.0)
+     {
+      note = "以损订仓：止损距离为 0，已用固定手数；";
+      return fallbackVolume;
+     }
+
+   //--- Money lost per 1.00 lot when price travels `dist` against us.
+   //    TICK_VALUE is quoted per TICK_SIZE of price, so scale by dist/tick_size.
+   double tick_value = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tick_size  = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tick_value <= 0.0 || tick_size <= 0.0)
+     {
+      note = "以损订仓：品种未报告 TICK_VALUE/TICK_SIZE，已用固定手数；";
+      return fallbackVolume;
+     }
+
+   double loss_per_lot = (dist / tick_size) * tick_value;
+   if(loss_per_lot <= 0.0)
+     {
+      note = "以损订仓：每手亏损算出来是 0，已用固定手数；";
+      return fallbackVolume;
+     }
+
+   //--- Risk budget: fixed amount wins, otherwise a percentage of equity
+   double risk = InpRiskAmount;
+   if(risk <= 0.0)
+     {
+      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(equity <= 0.0)
+         equity = AccountInfoDouble(ACCOUNT_BALANCE);
+      if(equity <= 0.0)
+        {
+         note = "以损订仓：取不到账户净值，已用固定手数；";
+         return fallbackVolume;
+        }
+      risk = equity * InpRiskPercent / 100.0;
+     }
+   if(risk <= 0.0)
+     {
+      note = "以损订仓：风险金额为 0，已用固定手数；";
+      return fallbackVolume;
+     }
+
+   double lot = risk / loss_per_lot;
+
+   //--- Cap so a very tight stop cannot produce an absurd lot
+   double cap = (InpRiskMaxLot > 0.0 ? InpRiskMaxLot
+                                     : SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX));
+   if(cap > 0.0 && lot > cap)
+     {
+      lot = cap;
+      note += "已截断到手数上限；";
+     }
+
+   double volume = NormalizeVolumeValue(symbol, lot);
+   note += "以损订仓：风险 " + DoubleToString(risk, 2) + " / 每手亏损 " +
+           DoubleToString(loss_per_lot, 2) + " → " + DoubleToString(volume, 2) + " 手；";
+   return volume;
+  }
+
+//+------------------------------------------------------------------+
 //| Candidate filling modes for a symbol, best first                 |
 //+------------------------------------------------------------------+
 int BuildFillingCandidates(const string symbol, int &fills[])
@@ -1060,6 +1155,11 @@ void ExecuteSignal(const SignalData &sg, const bool manual = false)
       g_exec.note += CheckStops(symbol, price, sl, tp);
    //--- Volume
    double volume = (InpUseSignalVolume && sg.volume > 0.0) ? sg.volume : InpLot;
+   //--- 以损订仓：先按总风险算出总手数，再拆分，保证两笔合计风险仍是设定值
+   string risk_note = "";
+   volume = RiskBasedVolume(symbol, price, sl, volume, risk_note);
+   if(risk_note != "")
+      g_exec.note += risk_note;
    if(InpSplitTP2 && sg.tp2 > 0.0)
       volume = volume / 2.0;
    volume = NormalizeVolumeValue(symbol, volume);
@@ -1217,6 +1317,11 @@ void PlaceQuickOrder(const int dir)
       g_exec.note += CheckStops(symbol, price, sl, tp);
    //--- Volume
    double volume = (InpQuickLot > 0.0 ? InpQuickLot : InpLot);
+   //--- 以损订仓：一键单也有止损，同样按风险反推手数
+   string risk_note = "";
+   volume = RiskBasedVolume(symbol, price, sl, volume, risk_note);
+   if(risk_note != "")
+      g_exec.note += risk_note;
    volume = NormalizeVolumeValue(symbol, volume);
    //--- Send it
    int    retcode   = 0;
