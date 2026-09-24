@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timezone
 
 from pa_agent.data.base import (
@@ -44,6 +45,21 @@ _TF_MAP: dict[str, str] = {
     "1M":  "TIMEFRAME_MN1",
 }
 
+# ── Thread-safety ────────────────────────────────────────────────────────────
+# The MetaTrader5 Python binding is NOT thread-safe: it talks to the terminal
+# over a native IPC channel, and two threads calling into it at the same time
+# (e.g. the RefreshLoop worker doing copy_rates_from_pos() every second while
+# the GUI thread does symbol_info_tick() for the bar-close countdown) race
+# inside the native layer and take the whole process down with a segfault —
+# no Python traceback, no faulthandler dump, the app just disappears. That is
+# the "crashes after running for hours" symptom.
+#
+# Every native MT5 call must therefore hold this lock. It is reentrant so
+# nested calls on the same thread (e.g. last_error() right after
+# copy_rates_from_pos()) are safe. Keep the critical sections short: the
+# RefreshLoop calls in here once per second.
+_MT5_LOCK = threading.RLock()
+
 
 class MT5Source(DataSource):
     """Live K-line data from MetaTrader 5 terminal.
@@ -68,14 +84,15 @@ class MT5Source(DataSource):
                 "MetaTrader5 package not installed — run: pip install MetaTrader5"
             ) from exc
 
-        if not mt5.initialize():
-            error = mt5.last_error()
-            raise DataSourceTransientError(
-                f"MT5 initialize() failed: {error}. "
-                "Make sure MetaTrader 5 terminal is open and logged in."
-            )
+        with _MT5_LOCK:
+            if not mt5.initialize():
+                error = mt5.last_error()
+                raise DataSourceTransientError(
+                    f"MT5 initialize() failed: {error}. "
+                    "Make sure MetaTrader 5 terminal is open and logged in."
+                )
 
-        info = mt5.terminal_info()
+            info = mt5.terminal_info()
         if info is not None:
             logger.info(
                 "MT5 connected: terminal=%s, build=%s, connected=%s",
@@ -91,7 +108,8 @@ class MT5Source(DataSource):
         if self._connected:
             try:
                 import MetaTrader5 as mt5  # type: ignore[import]
-                mt5.shutdown()
+                with _MT5_LOCK:
+                    mt5.shutdown()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("MT5 shutdown error: %s", exc)
         self._connected = False
@@ -108,7 +126,8 @@ class MT5Source(DataSource):
             return True
         try:
             import MetaTrader5 as mt5  # type: ignore[import]
-            return mt5.symbol_info(name) is not None
+            with _MT5_LOCK:
+                return mt5.symbol_info(name) is not None
         except Exception as exc:  # noqa: BLE001
             logger.debug("MT5 symbol_info(%s) failed: %s", name, exc)
             return False
@@ -120,7 +139,8 @@ class MT5Source(DataSource):
                     "AUDUSD", "USDCAD", "NZDUSD", "XAGUSD"]
         try:
             import MetaTrader5 as mt5  # type: ignore[import]
-            symbols = mt5.symbols_get()
+            with _MT5_LOCK:
+                symbols = mt5.symbols_get()
             if symbols:
                 return [s.name for s in symbols]
         except Exception as exc:  # noqa: BLE001
@@ -144,7 +164,8 @@ class MT5Source(DataSource):
         if self._connected:
             try:
                 import MetaTrader5 as mt5  # type: ignore[import]
-                mt5.symbol_select(symbol, True)
+                with _MT5_LOCK:
+                    mt5.symbol_select(symbol, True)
             except Exception:  # noqa: BLE001
                 pass
         logger.info("MT5Source subscribed: %s %s", symbol, timeframe)
@@ -168,7 +189,8 @@ class MT5Source(DataSource):
         try:
             import MetaTrader5 as mt5  # type: ignore[import]
 
-            tick = mt5.symbol_info_tick(name)
+            with _MT5_LOCK:
+                tick = mt5.symbol_info_tick(name)
             if tick is None:
                 return None
             time_msc = getattr(tick, "time_msc", None)
@@ -208,21 +230,31 @@ class MT5Source(DataSource):
                 f"MT5 timeframe constant {tf_name!r} not found"
             ) from exc
 
-        # Ensure the symbol is selected/subscribed in MT5 for real-time data
-        try:
-            mt5.symbol_select(self._symbol, True)
-        except Exception:  # noqa: BLE001
-            pass  # Non-fatal; proceed with fetch
+        # Fetch n+1 bars starting from position 0 (current forming bar).
+        #
+        # NOTE: symbol_select() used to run here on every fetch. The RefreshLoop
+        # calls this once per second, so that was an extra native IPC round-trip
+        # per tick — pure overhead (subscribe() already selected the symbol) and
+        # it widened the window for the native race described at _MT5_LOCK.
+        # It now only runs as a one-shot recovery when a fetch comes back empty.
+        with _MT5_LOCK:
+            rates = mt5.copy_rates_from_pos(self._symbol, tf_const, 0, n + 1)
 
-        # Fetch n+1 bars starting from position 0 (current forming bar)
-        rates = mt5.copy_rates_from_pos(self._symbol, tf_const, 0, n + 1)
+            if (rates is None or len(rates) == 0) and self._symbol:
+                # Possibly deselected in the terminal (e.g. Market Watch
+                # cleanup) — re-select once and retry before giving up.
+                try:
+                    mt5.symbol_select(self._symbol, True)
+                except Exception:  # noqa: BLE001
+                    pass
+                rates = mt5.copy_rates_from_pos(self._symbol, tf_const, 0, n + 1)
 
-        if rates is None or len(rates) == 0:
-            error = mt5.last_error()
-            raise DataSourceTransientError(
-                f"MT5 copy_rates_from_pos failed for {self._symbol} {self._timeframe}: "
-                f"{error}"
-            )
+            if rates is None or len(rates) == 0:
+                error = mt5.last_error()
+                raise DataSourceTransientError(
+                    f"MT5 copy_rates_from_pos failed for {self._symbol} {self._timeframe}: "
+                    f"{error}"
+                )
 
         # copy_rates_from_pos returns oldest-first (ascending time order).
         # rates[0] is the OLDEST bar, rates[-1] is the NEWEST (forming) bar.

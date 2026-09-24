@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from typing import Any
 
 from PyQt6.QtCore import QThread, QTimer, pyqtSignal, QObject
@@ -2474,6 +2475,26 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             logger.debug("_refresh_keep_analysis_sentinel error: %s", exc)
 
+    # ── Log throttling ───────────────────────────────────────────────────────
+    # _check_keep_analysis() runs on every RefreshLoop tick (1 Hz). Its "no new
+    # bar yet" branches used to log on every single tick — ~86k lines/day that
+    # bury everything else and keep the disk/CPU busy for no reason. These are
+    # state notifications, not events, so they are throttled to at most one line
+    # per key per interval.
+    _LOG_THROTTLE_SEC = 60.0
+
+    def _log_throttled(self, key: str, msg: str, *args: Any) -> None:
+        """Log *msg* at DEBUG at most once per ``_LOG_THROTTLE_SEC`` per *key*."""
+        now = time.monotonic()
+        last = getattr(self, "_throttled_logs", None)
+        if last is None:
+            last = {}
+            self._throttled_logs = last
+        if now - last.get(key, 0.0) < self._LOG_THROTTLE_SEC:
+            return
+        last[key] = now
+        logger.debug(msg, *args)
+
     def _check_keep_analysis(self, bars: Any) -> None:
         """Trigger a new analysis round when keep-analysis is enabled and a new bar has closed.
 
@@ -2487,10 +2508,10 @@ class MainWindow(QMainWindow):
         if not self._keep_analysis_checkbox.isChecked():
             return
         if self._analysis_in_progress:
-            logger.debug("持续跟踪分析：跳过（分析进行中）")
+            self._log_throttled("keep_analysis_busy", "持续跟踪分析：跳过（分析进行中）")
             return
         if self._pending_submit_after_close:
-            logger.debug("持续跟踪分析：跳过（等待K线收盘中）")
+            self._log_throttled("keep_analysis_arming", "持续跟踪分析：跳过（等待K线收盘中）")
             return
         if getattr(self, "_demo_mode", False):
             return
@@ -2554,7 +2575,11 @@ class MainWindow(QMainWindow):
                 return
 
             if closed_ts == self._keep_analysis_last_closed_ts:
-                logger.debug("持续跟踪分析：无新K线（sentinel=%s）", closed_ts)
+                self._log_throttled(
+                    "keep_analysis_no_new_bar",
+                    "持续跟踪分析：无新K线（sentinel=%s）",
+                    closed_ts,
+                )
                 return  # No new bar yet
 
             # New bar has closed — update sentinel and trigger analysis

@@ -52,8 +52,18 @@ def main(argv: list[str] | None = None) -> int:
 
     # Update logging with the real API key now that settings are loaded
     if ctx.settings is not None:
-        from pa_agent.util.logging import configure_logging, update_api_key
-        configure_logging(api_key=ctx.settings.provider.api_key)
+        from pa_agent.util.logging import (
+            configure_logging,
+            level_name_to_int,
+            update_api_key,
+        )
+
+        # Honour the configured file level (default INFO) so long-running
+        # instances don't fill the log with per-tick DEBUG noise.
+        file_level = level_name_to_int(
+            getattr(ctx.settings.general, "log_file_level", "INFO")
+        )
+        configure_logging(api_key=ctx.settings.provider.api_key, file_level=file_level)
         from pa_agent.util.crash_diagnostics import log_startup_diagnostics
         log_startup_diagnostics()
 

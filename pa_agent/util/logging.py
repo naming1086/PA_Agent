@@ -20,6 +20,7 @@ from pa_agent.util.mask_secret import mask_secret
 
 _active_formatters: List["MaskingFormatter"] = []
 _configured: bool = False
+_file_handler: "logging.Handler | None" = None
 
 # ── MaskingFormatter ──────────────────────────────────────────────────────────
 
@@ -61,17 +62,33 @@ class _ExactNameFilter(logging.Filter):
 
 _LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
 
-_THIRD_PARTY_LOGGERS = ("urllib3", "openai", "httpx")
+_THIRD_PARTY_LOGGERS = ("urllib3", "openai", "httpx", "httpcore")
 
 # tvdatafeed opens a websocket every refresh tick and logs at DEBUG — keep quiet
 _QUIET_LOGGER_NAMES = (
     "urllib3",
     "openai",
     "httpx",
+    "httpcore",
+    "httpcore2",
     "tvDatafeed",
     "tvDatafeed.main",
     "websocket",
 )
+
+# Level names accepted for the configurable file-handler level.
+_LEVEL_NAMES = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+
+def level_name_to_int(name: str, default: int = logging.INFO) -> int:
+    """Convert a level name (e.g. ``"INFO"``) to its int value; falls back to default."""
+    return _LEVEL_NAMES.get(str(name).strip().upper(), default)
 
 # tvdatafeed logs its websocket chatter straight on the root logger, whose
 # record.name is "root".  Those records are dropped by a filter instead of by
@@ -90,19 +107,29 @@ def verify_logging_handlers() -> bool:
     return False
 
 
-def configure_logging(api_key: str = "") -> None:
+def configure_logging(api_key: str = "", file_level: int = logging.INFO) -> None:
     """Configure the root logger with rotating file handler and console handler.
 
     Both handlers use MaskingFormatter that replaces api_key with mask_secret(api_key).
-    Third-party loggers (urllib3, openai, httpx) are also attached to the same handlers.
+    Third-party loggers (urllib3, openai, httpx, httpcore) are also attached to the
+    same handlers.
+
+    ``file_level`` caps what the rotating file handler emits.  Long-running instances
+    should use ``logging.INFO`` (the default) so per-tick status spam and httpcore
+    connection chatter stay out of the log file; pass ``logging.DEBUG`` only when
+    troubleshooting.
 
     If handlers were removed after a prior configure_logging call, re-attaches them.
     """
-    global _configured  # noqa: PLW0603
+    global _configured, _file_handler  # noqa: PLW0603
 
     if _configured:
         if api_key:
             update_api_key(api_key)
+        # The desired file level can change between calls (early boot vs. after
+        # settings load) — honour it even when handlers are already installed.
+        if _file_handler is not None:
+            _file_handler.setLevel(file_level)
         if verify_logging_handlers():
             return
         # Handlers missing (e.g. external code cleared root.handlers) — re-install.
@@ -125,7 +152,11 @@ def configure_logging(api_key: str = "") -> None:
         backupCount=10,
         encoding="utf-8",
     )
+    # Default INFO: a long-running instance writes one status line per RefreshLoop
+    # tick, which at DEBUG floods the file (and the disk) within hours.
+    file_handler.setLevel(file_level)
     file_handler.setFormatter(file_formatter)
+    _file_handler = file_handler
 
     # Drop the noisy records logged directly on the root logger
     name_filter = _ExactNameFilter(_DROPPED_LOGGER_NAMES)

@@ -94,6 +94,9 @@ class GeneralSettings(BaseModel):
     enable_next_bar_prediction: bool = False
     #: 同一结构位 entry 相差≤3跳时，禁止反向新方案的冷却 K 线根数（已收盘）
     structure_flip_cooldown_bars: int = Field(default=3, ge=1, le=50)
+    #: 日志文件级别（DEBUG/INFO/WARNING/ERROR）。长时间运行建议 INFO，避免每 tick 状态日志与
+    #: httpcore 连接池噪声把日志刷爆；排查问题时再临时改成 DEBUG
+    log_file_level: str = Field(default="INFO")
 
     @field_validator("last_data_source", mode="before")
     @classmethod
@@ -114,6 +117,16 @@ class GeneralSettings(BaseModel):
         if v is None:
             return 50
         return v
+
+    @field_validator("log_file_level", mode="before")
+    @classmethod
+    def _coerce_log_level(cls, v: object) -> object:
+        if v is None:
+            return "INFO"
+        name = str(v).strip().upper()
+        if name not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            return "INFO"
+        return name
 
 
 _FEISHU_CONFIG_KEYS = (
