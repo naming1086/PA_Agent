@@ -969,7 +969,7 @@ string CheckStops(const string symbol, const double price, double &sl, double &t
 //+------------------------------------------------------------------+
 //| Turn the last signal into an order (or explain why not)          |
 //+------------------------------------------------------------------+
-void ExecuteSignal(const SignalData &sg)
+void ExecuteSignal(const SignalData &sg, const bool manual = false)
   {
    //--- Reset the cached outcome
    g_exec.attempted = true;
@@ -981,8 +981,10 @@ void ExecuteSignal(const SignalData &sg)
    g_exec.volume    = 0.0;
    g_exec.note      = "";
    g_exec.ok        = false;
-   //--- Dry run by default: never trade unless the user opted in
-   if(!InpAutoTrade)
+   //--- Dry run by default: never trade unless the user opted in.
+   //    A one-click button press IS the explicit opt-in, so manual=true
+   //    bypasses the InpAutoTrade gate.
+   if(!InpAutoTrade && !manual)
      {
       g_exec.note = "自动下单已关闭（InpAutoTrade = false）—— 只显示信号，不下单";
       return;
@@ -1100,6 +1102,23 @@ void ExecuteSignal(const SignalData &sg)
 //+------------------------------------------------------------------+
 void PlaceQuickOrder(const int dir)
   {
+   //--- The buttons exist to execute the pending signal by hand: when the last
+   //    signal matches this button's direction and the chart symbol, send THAT
+   //    order — its 限价/突破 type, its entry price, its SL/TP — instead of a
+   //    fixed-distance quick one.  Otherwise a 限价单 signal silently became a
+   //    market order the moment the user clicked the button.
+   //    The click itself is the explicit opt-in, so this bypasses InpAutoTrade.
+   int sigDir  = DirectionOf(g_sig.direction);
+   int sigKind = OrderKind(g_sig.orderType);
+   bool sigStale = (InpMaxSignalAgeSec > 0 && g_sig.createdAt > 0 &&
+                    (long)TimeGMT() - g_sig.createdAt > (long)InpMaxSignalAgeSec);
+   if(sigKind != 0 && sigDir == dir && !sigStale &&
+      StringCompare(g_sig.symbol, _Symbol, false) == 0)
+     {
+      ExecuteSignal(g_sig, true);
+      return;
+     }
+   //--- No matching signal — fall back to the fixed-distance quick order
    //--- Reset the cached outcome
    ResetExec();
    g_exec.attempted = true;
@@ -1148,6 +1167,45 @@ void PlaceQuickOrder(const int dir)
        price = (dir > 0 ? tick.ask + distance : tick.bid - distance);
       }
    price = NormalizeDouble(price, digits);
+   //--- Pending orders: the entry price must sit on the right side of the market
+   //    AND far enough away (SYMBOL_TRADE_STOPS_LEVEL).  Otherwise the server
+   //    either rejects it, or the order lands on the current price and fills on
+   //    the spot — which looks exactly like the button sent a market order.
+   if(kind != 1)
+     {
+      double ref = (dir > 0 ? tick.ask : tick.bid);
+      bool   wrongSide;
+      if(kind == 2)  // limit: buy below the market, sell above it
+         wrongSide = (dir > 0 ? price >= ref : price <= ref);
+      else           // stop: buy above the market, sell below it
+         wrongSide = (dir > 0 ? price <= ref : price >= ref);
+      if(wrongSide)
+        {
+         g_exec.note = "挂单价方向错误：计算价 " + DoubleToString(price, digits) +
+                       " / 当前价 " + DoubleToString(ref, digits) +
+                       " —— 挂出会立刻成交（等同市价单），已取消。请检查「挂单距市价」。";
+         return;
+        }
+      //--- Enforce the broker minimum distance for pending orders
+      int level  = (int)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+      int freeze = (int)SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+      int need   = (level > freeze ? level : freeze);
+      if(need > 0)
+        {
+         double minDist = need * point;
+         double dist    = MathAbs(price - ref);
+         if(dist < minDist)
+           {
+            double fixedPrice = (price > ref)
+                                ? NormalizeDouble(ref + minDist + point, digits)
+                                : NormalizeDouble(ref - minDist - point, digits);
+            g_exec.note += "挂单价距市价仅 " + DoubleToString(dist / point, 0) +
+                           " point，低于最小 " + IntegerToString(need) +
+                           " point，已自动放宽至 " + DoubleToString(fixedPrice, digits) + "；";
+            price = fixedPrice;
+           }
+        }
+     }
    //--- Stops: TP defaults to the same distance as SL, which is a clean 1:1
    double slPoints = (double)InpQuickSLPoints;
    double tpPoints = (InpQuickTPPoints > 0 ? (double)InpQuickTPPoints : slPoints);
@@ -1177,7 +1235,8 @@ void PlaceQuickOrder(const int dir)
    //--- Explain the outcome
    string modeText = (InpQuickMode == QUICK_MARKET ? "市价" :
                       (InpQuickMode == QUICK_LIMIT ? "限价挂单" : "突破挂单"));
-   g_exec.note += "一键" + (dir > 0 ? "做多" : "做空") + "（" + modeText + "）：" +
+   g_exec.note += "一键" + (dir > 0 ? "做多" : "做空") + "（" + modeText + "）" +
+                  (kind == 1 ? "" : " @ " + DoubleToString(price, digits)) + "：" +
                   RetcodeText(retcode);
   }
 
