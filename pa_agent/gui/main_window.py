@@ -618,22 +618,28 @@ class MainWindow(QMainWindow):
         self._demo_btn.setToolTip("用 records/pending 中已保存的分析记录回放界面")
         self._demo_btn.clicked.connect(self._on_demo_mode_button)
 
-        # 持续跟踪分析勾选框：勾选后有新K线收盘时自动开始新一轮分析
-        # 每次启动强制为未勾选，避免程序启动时立即自动拉取数据
+        # 持续跟踪分析勾选框：勾选后有新K线收盘时自动开始新一轮分析。
+        # 默认开启（无人值守常驻运行的主场景），初始值取自持久化的 general.keep_analysis；
+        # 用户手动取消勾选时会写回设置，下次启动保持关闭。
         self._keep_analysis_checkbox = QCheckBox("持续跟踪分析")
-        self._keep_analysis_checkbox.setChecked(False)
+        _keep_default = True
+        if _settings is not None:
+            _keep_default = bool(getattr(_settings.general, "keep_analysis", True))
+        self._keep_analysis_checkbox.setChecked(_keep_default)
         self._keep_analysis_checkbox.setToolTip(
             "勾选后，每当有新的K线收盘时自动开始新一轮分析"
         )
         self._keep_analysis_checkbox.stateChanged.connect(self._on_keep_analysis_checkbox_changed)
         ctrl_layout.addWidget(self._keep_analysis_checkbox)
 
-        # Reset persisted keep_analysis flag so future restarts also start unchecked
-        if _settings is not None:
-            try:
-                _settings.general.keep_analysis = False
-            except Exception:  # noqa: BLE001
-                pass
+        # 与 _on_keep_analysis_checkbox_changed 保持一致：开启时同步勾选并锁定
+        # 「等待最新K线收盘后再提交分析」，避免启动后两个勾选框状态不一致。
+        # 这里不直接调用该处理器，以免在界面尚未构建完成时就去启动 RefreshLoop 线程。
+        if _keep_default:
+            self._wait_close_checkbox.blockSignals(True)
+            self._wait_close_checkbox.setChecked(True)
+            self._wait_close_checkbox.blockSignals(False)
+            self._wait_close_checkbox.setEnabled(False)
 
         self._resume_chart_btn = QPushButton("图表实时更新")
         self._resume_chart_btn.setEnabled(False)
@@ -4248,6 +4254,24 @@ class MainWindow(QMainWindow):
         if not self._startup_tv_connectivity_check_done:
             self._startup_tv_connectivity_check_done = True
             QTimer.singleShot(0, self._on_startup_tv_connectivity_check)
+        if not getattr(self, "_startup_autostart_done", False):
+            self._startup_autostart_done = True
+            QTimer.singleShot(0, self._on_startup_auto_start_refresh)
+
+    def _on_startup_auto_start_refresh(self) -> None:
+        """Auto-start data fetch when 「持续跟踪分析」 is on at launch.
+
+        Keep-analysis only fires on RefreshLoop ticks, so with the checkbox
+        enabled by default but no running loop, it would never trigger an
+        analysis round.  This mirrors what checking the box by hand does, but
+        is deferred until the window is shown so the loop cannot touch a
+        half-built UI.
+        """
+        cb = getattr(self, "_keep_analysis_checkbox", None)
+        if cb is None or not cb.isChecked():
+            return
+        self._ensure_refresh_loop_running()
+
     def _on_startup_tv_connectivity_check(self) -> None:
         if self._current_data_source_kind() != "tradingview":
             return
