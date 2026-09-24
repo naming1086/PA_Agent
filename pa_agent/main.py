@@ -29,7 +29,17 @@ def main(argv: list[str] | None = None) -> int:
 
     argv = list(sys.argv if argv is None else argv)
     app = QApplication(argv)
-    app.setApplicationName("PA Agent")
+    # Per-profile identity: distinct application name, taskbar grouping and icon,
+    # so several timeframe instances are easy to tell apart (and not collapsed
+    # into one taskbar button by Windows).
+    app.setApplicationName(f"PA Agent [{PROFILE_NAME}]" if PROFILE_NAME else "PA Agent")
+
+    from pa_agent.gui.app_icon import build_app_icon, set_windows_app_model_id
+
+    set_windows_app_model_id(PROFILE_NAME)
+    icon = build_app_icon(PROFILE_NAME)
+    if icon is not None:
+        app.setWindowIcon(icon)
 
     from pa_agent.gui.theme import apply_theme
     apply_theme(app)
@@ -49,7 +59,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # Build and show the main window
     from pa_agent.gui.main_window import MainWindow
+
     window = MainWindow(ctx)
+    if PROFILE_NAME:
+        window.setWindowTitle(
+            f"PA Agent [{PROFILE_NAME}] — Trading Terminal"
+            "（分析仅供参考，不构成投资建议）"
+        )
     window.show()
 
     logger.info("Main window shown")

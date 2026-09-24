@@ -70,6 +70,22 @@ input string InpComment            = "PA_Agent"; // 订单注释
 input bool   InpCheckStopsLevel    = true;   // 检查止损/止盈最小距离
 input bool   InpFixStopsLevel      = false;  // 自动放宽过近的 SL/TP（默认否）
 
+//--- 一键下单方式（面板按钮使用）
+enum ENUM_QUICK_MODE
+  {
+   QUICK_MARKET = 0, // 市价单
+   QUICK_LIMIT  = 1, // 限价挂单（回踩接）
+   QUICK_STOP   = 2  // 突破挂单
+  };
+
+input group "QUICK"
+input ENUM_QUICK_MODE InpQuickMode = QUICK_MARKET; // 一键下单方式
+input int    InpQuickDistance = 100;    // 挂单距市价（point，市价单忽略）
+input int    InpQuickSLPoints = 200;    // 止损距离（point）
+input int    InpQuickTPPoints = 0;      // 止盈距离（point，0 = 与止损相同即 1:1）
+input double InpQuickLot      = 0.0;    // 一键下单手数（0 = 用 InpLot）
+input bool   InpQuickOnlyCurrentSymbol = true; // 全部平仓只平当前品种
+
 input group "PANEL"
 input ENUM_BASE_CORNER InpCorner   = CORNER_LEFT_UPPER; // Panel corner
 input int    InpPanelX             = 10;     // Panel X offset
@@ -92,6 +108,9 @@ input color  InpWarnColor          = C'255,200,90';  // Warning text
 #define SB_BTN_SCAN  "SB_BTN_SCAN"
 #define SB_BTN_TEST  "SB_BTN_TEST"
 #define SB_BTN_CLEAR "SB_BTN_CLEAR"
+#define SB_BTN_BUY   "SB_BTN_BUY"
+#define SB_BTN_SELL  "SB_BTN_SELL"
+#define SB_BTN_CLOSE "SB_BTN_CLOSE"
 #define SB_LINE_PFX  "SB_LINE_"
 
 //--- Panel line buffer ----------------------------------------------
@@ -218,6 +237,30 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
      {
       ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
       WriteTestSignal();
+      RefreshPanel();
+      return;
+     }
+   //--- One-click buy
+   if(sparam == SB_BTN_BUY)
+     {
+      ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+      PlaceQuickOrder(1);
+      RefreshPanel();
+      return;
+     }
+   //--- One-click sell
+   if(sparam == SB_BTN_SELL)
+     {
+      ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+      PlaceQuickOrder(-1);
+      RefreshPanel();
+      return;
+     }
+   //--- Close every position
+   if(sparam == SB_BTN_CLOSE)
+     {
+      ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+      CloseAllNow();
       RefreshPanel();
       return;
      }
@@ -1053,6 +1096,177 @@ void ExecuteSignal(const SignalData &sg)
    g_exec.note += RetcodeText(retcode);
   }
 //+------------------------------------------------------------------+
+//| One-click order: market / limit / stop, taken from the panel      |
+//+------------------------------------------------------------------+
+void PlaceQuickOrder(const int dir)
+  {
+   //--- Reset the cached outcome
+   ResetExec();
+   g_exec.attempted = true;
+   g_exec.at        = TimeLocal();
+   //--- Trading must be allowed
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+     {
+      g_exec.note = "终端未启用算法交易：请点开工具栏 Algo Trading 按钮";
+      return;
+     }
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+     {
+      g_exec.note = "本 EA 不允许交易：检查终端的自动交易设置";
+      return;
+     }
+   //--- A fresh quote is always needed
+   string symbol = _Symbol;
+   SymbolSelect(symbol, true);
+   MqlTick tick;
+   if(!SymbolInfoTick(symbol, tick))
+     {
+      g_exec.note = "取不到 " + symbol + " 的报价";
+      return;
+     }
+   int    digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   double point  = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(point <= 0.0) point = 0.00001;
+   //--- Order type and price
+   int    kind;
+   double price;
+   double distance = InpQuickDistance * point;
+   if(InpQuickMode == QUICK_MARKET)
+     {
+      kind  = 1;
+      price = (dir > 0 ? tick.ask : tick.bid);
+     }
+   else
+    if(InpQuickMode == QUICK_LIMIT)
+      {
+       kind  = 2;
+       price = (dir > 0 ? tick.bid - distance : tick.ask + distance);
+      }
+    else
+      {
+       kind  = 3;
+       price = (dir > 0 ? tick.ask + distance : tick.bid - distance);
+      }
+   price = NormalizeDouble(price, digits);
+   //--- Stops: TP defaults to the same distance as SL, which is a clean 1:1
+   double slPoints = (double)InpQuickSLPoints;
+   double tpPoints = (InpQuickTPPoints > 0 ? (double)InpQuickTPPoints : slPoints);
+   double sl = (dir > 0 ? price - slPoints * point : price + slPoints * point);
+   double tp = (dir > 0 ? price + tpPoints * point : price - tpPoints * point);
+   sl = NormalizeDouble(sl, digits);
+   tp = NormalizeDouble(tp, digits);
+   if(InpCheckStopsLevel)
+      g_exec.note += CheckStops(symbol, price, sl, tp);
+   //--- Volume
+   double volume = (InpQuickLot > 0.0 ? InpQuickLot : InpLot);
+   volume = NormalizeVolumeValue(symbol, volume);
+   //--- Send it
+   int    retcode   = 0;
+   ulong  order     = 0;
+   ulong  deal      = 0;
+   double donePrice = 0.0;
+   double doneVol   = 0.0;
+   bool ok = SendOrder(symbol, kind, dir, volume, price, sl, tp,
+                       retcode, order, deal, donePrice, doneVol);
+   g_exec.retcode = retcode;
+   g_exec.order   = order;
+   g_exec.deal    = deal;
+   g_exec.price   = donePrice;
+   g_exec.volume  = doneVol;
+   g_exec.ok      = ok;
+   //--- Explain the outcome
+   string modeText = (InpQuickMode == QUICK_MARKET ? "市价" :
+                      (InpQuickMode == QUICK_LIMIT ? "限价挂单" : "突破挂单"));
+   g_exec.note += "一键" + (dir > 0 ? "做多" : "做空") + "（" + modeText + "）：" +
+                  RetcodeText(retcode);
+  }
+
+//+------------------------------------------------------------------+
+//| Close every open position (optionally only the current symbol)    |
+//+------------------------------------------------------------------+
+void CloseAllNow()
+  {
+   //--- Reset the cached outcome
+   ResetExec();
+   g_exec.attempted = true;
+   g_exec.at        = TimeLocal();
+   //--- Trading must be allowed
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+     {
+      g_exec.note = "终端未启用算法交易：请点开工具栏 Algo Trading 按钮";
+      return;
+     }
+   int closed   = 0;
+   int failed   = 0;
+   int lastCode = 0;
+   //--- Walk backwards because closing removes entries from the list
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      //--- Optionally leave other symbols alone
+      if(InpQuickOnlyCurrentSymbol && symbol != _Symbol) continue;
+      long   ptype = PositionGetInteger(POSITION_TYPE);
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      if(volume <= 0.0) continue;
+      //--- Build the closing request (opposite side, same volume)
+      MqlTradeRequest request;
+      MqlTradeResult  result;
+      ZeroMemory(request);
+      ZeroMemory(result);
+      request.action    = TRADE_ACTION_DEAL;
+      request.position  = ticket;
+      request.symbol    = symbol;
+      request.volume    = volume;
+      request.deviation = InpDeviation;
+      request.magic     = InpMagic;
+      request.comment   = "PA quick close";
+      if(ptype == POSITION_TYPE_BUY)
+        {
+         request.type  = ORDER_TYPE_SELL;
+         request.price = SymbolInfoDouble(symbol, SYMBOL_BID);
+        }
+      else
+        {
+         request.type  = ORDER_TYPE_BUY;
+         request.price = SymbolInfoDouble(symbol, SYMBOL_ASK);
+        }
+      request.type_time    = ORDER_TIME_GTC;
+      request.type_filling = ORDER_FILLING_RETURN;
+      //--- Try the supported filling modes until one is accepted
+      int fills[3];
+      int count = BuildFillingCandidates(symbol, fills);
+      for(int f = 0; f < count; f++)
+        {
+         request.type_filling = (ENUM_ORDER_TYPE_FILLING)fills[f];
+         ResetLastError();
+         bool sent = OrderSend(request, result);
+         lastCode = (int)result.retcode;
+         //--- 10008 placed, 10009 done, 10010 partially done
+         if(sent && (lastCode == 10008 || lastCode == 10009 || lastCode == 10010))
+           {
+            closed++;
+            break;
+           }
+         //--- 10030 = unsupported filling mode: try the next one
+         if(lastCode == 10030) continue;
+         failed++;
+         break;
+        }
+     }
+   //--- Report
+   g_exec.ok   = (failed == 0 && closed > 0);
+   g_exec.note = "全部平仓：成功 " + IntegerToString(closed) +
+                 " 笔，失败 " + IntegerToString(failed) + " 笔";
+   if(failed > 0)
+      g_exec.note += "（最后 " + RetcodeText(lastCode) + "）";
+   if(closed == 0 && failed == 0)
+      g_exec.note = "当前没有持仓可平";
+  }
+
+//+------------------------------------------------------------------+
 //| Copy one signal field by field (MQL5 struct assignment is limited)|
 //+------------------------------------------------------------------+
 void CopySignal(const SignalData &src, SignalData &dst)
@@ -1434,8 +1648,10 @@ void RefreshPanel()
    int padY   = 6;
    int lines  = ArraySize(g_lines);
    int btnH   = 22;
+   int btnGap = 6;
    int width  = (int)MathMax(240.0, (double)InpPanelWidth);
-   int height = padY * 2 + lines * InpLineHeight + btnH + 14;
+   //--- Two rows of buttons: folder tools on top, quick trading below
+   int height = padY * 2 + lines * InpLineHeight + btnH * 2 + btnGap + 14;
    //--- Background rectangle
    if(ObjectFind(0, SB_BG) < 0)
      {
@@ -1463,11 +1679,15 @@ void RefreshPanel()
    for(int i = lines; i < g_drawnLines; i++)
       ObjectDelete(0, SB_LINE_PFX + IntegerToString(i));
    g_drawnLines = lines;
-   //--- Buttons at the bottom of the panel
-   int btnY = InpPanelY + height - btnH - 6;
-   DrawButton(SB_BTN_SCAN,  InpPanelX + padX,                            btnY, 100, btnH, "立即扫描");
-   DrawButton(SB_BTN_TEST,  InpPanelX + padX + 100 + 8,                  btnY, 120, btnH, "写测试信号");
-   DrawButton(SB_BTN_CLEAR, InpPanelX + padX + 100 + 8 + 120 + 8,        btnY, 100, btnH, "清空状态");
+   //--- Buttons: folder tools (row 1) and quick trading (row 2)
+   int btnY2 = InpPanelY + height - btnH - 6;
+   int btnY1 = btnY2 - btnH - btnGap;
+   DrawButton(SB_BTN_SCAN,  InpPanelX + padX,          btnY1, 100, btnH, "立即扫描");
+   DrawButton(SB_BTN_TEST,  InpPanelX + padX + 108,    btnY1, 120, btnH, "写测试信号");
+   DrawButton(SB_BTN_CLEAR, InpPanelX + padX + 236,    btnY1, 100, btnH, "清空状态");
+   DrawButton(SB_BTN_BUY,   InpPanelX + padX,          btnY2, 100, btnH, "一键做多");
+   DrawButton(SB_BTN_SELL,  InpPanelX + padX + 108,    btnY2, 100, btnH, "一键做空");
+   DrawButton(SB_BTN_CLOSE, InpPanelX + padX + 216,    btnY2, 120, btnH, "全部平仓");
    //--- Repaint the chart
    ChartRedraw(0);
   }
