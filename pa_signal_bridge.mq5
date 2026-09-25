@@ -92,6 +92,15 @@ input int    InpQuickTPPoints = 0;      // 止盈距离（point，0 = 与止损�
 input double InpQuickLot      = 0.0;    // 一键下单手数（0 = 用 InpLot）
 input bool   InpQuickOnlyCurrentSymbol = true; // 全部平仓只平当前品种
 
+input group "PROFIT GUARD（盈利保护·实时移动止损）"
+input bool   InpProfitGuard       = true;   // 启用盈利保护
+input double InpBEStepPct         = 50.0;   // 盈利达目标的多少%→保本（0=关闭保本）
+input double InpLockTriggerPct    = 85.0;   // 盈利达目标的多少%→启动锁利
+input double InpLockProfitPct     = 50.0;   // 锁利比例：止损位=入场±该比例×当前盈利
+input bool   InpGuardOnlyMyMagic  = true;   // 只管理本 EA(magic) 开的仓
+input bool   InpGuardOnlyCurrentSymbol = true; // 只管理当前图表品种
+input bool   InpGuardRespectStopsLevel = true; // 锁利位离市价过近时自动放宽
+
 input group "PANEL"
 input ENUM_BASE_CORNER InpCorner   = CORNER_LEFT_UPPER; // Panel corner
 input int    InpPanelX             = 10;     // Panel X offset
@@ -172,6 +181,7 @@ string      g_dirNote = ""; // Note about the signal folder
 int         g_pending = 0;  // Files waiting to be processed
 int         g_scans   = 0;  // Number of scans performed
 datetime    g_lastScan = 0; // Time of the last scan
+datetime    g_lastGuard = 0; // Last profit-guard modification time (throttle)
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
@@ -213,6 +223,7 @@ void OnTimer()
   {
    //--- Read new files, then repaint
    ScanOnce();
+   GuardPositions();
    RefreshPanel();
   }
 
@@ -221,6 +232,8 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void OnTick()
   {
+   //--- Real-time profit protection runs on every tick
+   GuardPositions();
   }
 
 //+------------------------------------------------------------------+
@@ -1137,7 +1150,10 @@ void ExecuteSignal(const SignalData &sg, const bool manual = false)
       return;
      }
    price = NormalizeDouble(price, digits);
-   //--- Warn when a pending order sits on the wrong side of the market
+   //--- Pending orders must rest on the correct side of the market. If they
+   //    don't, the trade server either rejects them or fills them instantly as
+   //    a MARKET deal — which is the surprising "市价单" the user never asked for.
+   //    Warn, then BLOCK (do not send).  Mirrors the guard in PlaceQuickOrder.
    if(kind == 2 && dir > 0 && price >= tick.ask)
       g_exec.note += "买入限价 " + DoubleToString(price, digits) + " 不低于卖价 " +
                      DoubleToString(tick.ask, digits) + "（会立刻成交或被拒）；";
@@ -1148,6 +1164,22 @@ void ExecuteSignal(const SignalData &sg, const bool manual = false)
       g_exec.note += "买入止损 " + DoubleToString(price, digits) + " 不高于卖价（突破单方向可能反了）；";
    if(kind == 3 && dir < 0 && price >= tick.bid)
       g_exec.note += "卖出止损 " + DoubleToString(price, digits) + " 不低于买价（突破单方向可能反了）；";
+   //--- Block wrong-side pending orders instead of letting them market-fill.
+   if(kind != 1)
+     {
+      double ref = (dir > 0 ? tick.ask : tick.bid);
+      bool   wrongSide = (kind == 2)
+                         ? (dir > 0 ? price >= ref : price <= ref)   // limit
+                         : (dir > 0 ? price <= ref : price >= ref);  // stop
+      if(wrongSide)
+        {
+         g_exec.note = "挂单价已在市价另一侧，未下" +
+            (kind == 2 ? "限价" : "突破") + "单（也不转为市价单）：计算价 " +
+            DoubleToString(price, digits) + "，当前价 " + DoubleToString(ref, digits) +
+            "。信号发出后价格已越过挂单位，回撤/突破接单失效；如需市价入场请让模型改发「市价单」信号。";
+         return;
+        }
+     }
    //--- Stops
    double sl = (sg.sl  > 0.0) ? NormalizeDouble(sg.sl,  digits) : 0.0;
    double tp = (sg.tp1 > 0.0) ? NormalizeDouble(sg.tp1, digits) : 0.0;
@@ -1428,6 +1460,141 @@ void CloseAllNow()
       g_exec.note += "（最后 " + RetcodeText(lastCode) + "）";
    if(closed == 0 && failed == 0)
       g_exec.note = "当前没有持仓可平";
+  }
+
+//+------------------------------------------------------------------+
+//| Move only the stop loss of an open position (keep its TP)          |
+//+------------------------------------------------------------------+
+bool ModifyPositionSL(const ulong ticket, const string symbol,
+                      const double newSL, const double keepTP)
+  {
+   //--- Build a SL/TP modification request
+   MqlTradeRequest request;
+   MqlTradeResult  result;
+   ZeroMemory(request);
+   ZeroMemory(result);
+   request.action   = TRADE_ACTION_SLTP;
+   request.position = ticket;
+   request.symbol   = symbol;
+   request.sl       = newSL;
+   request.tp       = keepTP;   // 传当前 TP，避免误清空止盈
+   request.deviation= InpDeviation;
+   //--- Send and treat the usual "accepted" codes as success
+   ResetLastError();
+   bool sent = OrderSend(request, result);
+   return (sent && (result.retcode == 10008 || result.retcode == 10009 ||
+                    result.retcode == 10010));
+  }
+
+//+------------------------------------------------------------------+
+//| Real-time profit protection: breakeven + profit lock               |
+//+------------------------------------------------------------------+
+void GuardPositions()
+  {
+   //--- Feature & trading-permission gates
+   if(!InpProfitGuard) return;
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return;
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED)) return;
+   //--- Throttle: at most one modification sweep per second
+   datetime now = TimeCurrent();
+   if(now - g_lastGuard < 1) return;
+   double bePct  = InpBEStepPct / 100.0;
+   double lockAt = InpLockTriggerPct / 100.0;
+   if(bePct <= 0.0 && lockAt <= 0.0) return;
+   double lockFrac = InpLockProfitPct / 100.0;
+   //--- Walk every open position (backwards: closing/modifying is safe here)
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      //--- Only manage positions this EA owns
+      if(InpGuardOnlyMyMagic &&
+         PositionGetInteger(POSITION_MAGIC) != (long)InpMagic) continue;
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      if(InpGuardOnlyCurrentSymbol && symbol != _Symbol) continue;
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double curSL = PositionGetDouble(POSITION_SL);
+      double tp1   = PositionGetDouble(POSITION_TP);
+      long   ptype = PositionGetInteger(POSITION_TYPE);
+      double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+      if(point <= 0.0) point = 0.00001;
+      int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+      //--- Mark-to-market price on the closeable side
+      double mark = (ptype == POSITION_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_BID)
+                                                 : SymbolInfoDouble(symbol, SYMBOL_ASK);
+      double profDist = (ptype == POSITION_TYPE_BUY) ? (mark - entry) : (entry - mark);
+      if(profDist <= 0.0) continue;   // 未盈利，不动
+      //--- Reference "target": TP1 if set, else a 1:1 risk distance
+      double target;
+      if(tp1 > 0.0)
+         target = (ptype == POSITION_TYPE_BUY) ? (tp1 - entry) : (entry - tp1);
+      else if(curSL > 0.0)
+         target = (ptype == POSITION_TYPE_BUY) ? (entry - curSL) : (curSL - entry);
+      else
+         continue;                    // 无参考目标，跳过
+      if(target <= 0.0) continue;
+      double profitPct = profDist / target;
+      //--- Decide the desired stop loss
+      double desiredSL = 0.0;
+      bool   doGuard   = false;
+      if(lockAt > 0.0 && profitPct >= lockAt)
+        {
+         // 锁利：止损位 = 入场 ± lockFrac × 当前盈利（随盈利上移，自动 trailing）
+         double lockDist = lockFrac * profDist;
+         desiredSL = (ptype == POSITION_TYPE_BUY) ? (entry + lockDist)
+                                                  : (entry - lockDist);
+         doGuard = true;
+        }
+      else if(bePct > 0.0 && profitPct >= bePct)
+        {
+         desiredSL = entry;           // 保本
+         doGuard = true;
+        }
+      if(!doGuard) continue;
+      desiredSL = NormalizeDouble(desiredSL, digits);
+      //--- Never loosen the stop: new SL must improve protection
+      bool better = (ptype == POSITION_TYPE_BUY) ? (desiredSL > curSL + point * 0.5)
+                                                : (desiredSL < curSL - point * 0.5);
+      if(!better) continue;
+      //--- Respect the broker's minimum stop distance
+      if(InpGuardRespectStopsLevel)
+        {
+         int level = (int)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+         if(level > 0)
+           {
+            double minDist = level * point;
+            double distToPrice = (ptype == POSITION_TYPE_BUY) ? (mark - desiredSL)
+                                                             : (desiredSL - mark);
+            if(distToPrice < minDist)
+              {
+               double clamped = (ptype == POSITION_TYPE_BUY)
+                  ? NormalizeDouble(mark - minDist - point, digits)
+                  : NormalizeDouble(mark + minDist + point, digits);
+               bool cBetter = (ptype == POSITION_TYPE_BUY) ? (clamped > curSL + point * 0.5)
+                                                          : (clamped < curSL - point * 0.5);
+               if(!cBetter) continue;  // 放宽后会变糟，跳过本次
+               desiredSL = clamped;
+              }
+           }
+        }
+      //--- Skip if the change is below one point (no real movement)
+      double diff = (ptype == POSITION_TYPE_BUY) ? (desiredSL - curSL)
+                                                : (curSL - desiredSL);
+      if(diff < point) continue;
+      //--- Apply the modification (keep the current TP untouched)
+      double curTP = PositionGetDouble(POSITION_TP);
+      if(ModifyPositionSL(ticket, symbol, desiredSL, curTP))
+        {
+         string stage = (lockAt > 0.0 && profitPct >= lockAt) ? "锁利" : "保本";
+         Print("PA_Agent 盈利保护[" + symbol + " " +
+               (ptype == POSITION_TYPE_BUY ? "BUY" : "SELL") + "] " + stage +
+               ": 盈利 " + DoubleToString(profitPct * 100.0, 1) + "% → SL 移至 " +
+               DoubleToString(desiredSL, digits) + "（原 " +
+               DoubleToString(curSL, digits) + "）");
+        }
+     }
+   g_lastGuard = now;
   }
 
 //+------------------------------------------------------------------+
